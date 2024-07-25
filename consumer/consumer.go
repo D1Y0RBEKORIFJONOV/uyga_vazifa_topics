@@ -1,13 +1,32 @@
 package main
 
 import (
-	"encoding/json"
+	"context"
 	"github.com/streadway/amqp"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 	"log"
-	"net/http"
 )
 
-func publishMessage(body string, routingKey string) {
+func handleMessage(msg amqp.Delivery) {
+	clientOptions := options.Client().ApplyURI("mongodb://localhost:27017")
+	client, err := mongo.Connect(context.Background(), clientOptions)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer client.Disconnect(context.Background())
+
+	collection := client.Database("testdb").Collection("messages")
+	_, err = collection.InsertOne(context.Background(), bson.M{"body": string(msg.Body), "routing_key": msg.RoutingKey})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	log.Printf("Received a message: %s", msg.Body)
+}
+
+func consumeMessages(routingKey string) {
 	conn, err := amqp.Dial("amqp://guest:guest@localhost:5672/")
 	if err != nil {
 		log.Fatal(err)
@@ -20,37 +39,50 @@ func publishMessage(body string, routingKey string) {
 	}
 	defer ch.Close()
 
-	err = ch.Publish(
-		"topic_logs", // exchange
-		routingKey,   // routing key
-		false,        // mandatory
-		false,        // immediate
-		amqp.Publishing{
-			ContentType: "text/plain",
-			Body:        []byte(body),
-		},
+	q, err := ch.QueueDeclare(
+		"",    // name
+		false, // durable
+		true,  // delete when unused
+		true,  // exclusive
+		false, // no-wait
+		nil,   // arguments
 	)
 	if err != nil {
 		log.Fatal(err)
 	}
-}
 
-func createMessageHandler(w http.ResponseWriter, r *http.Request) {
-	var msg struct {
-		Body       string `json:"body"`
-		RoutingKey string `json:"routing_key"`
-	}
-	err := json.NewDecoder(r.Body).Decode(&msg)
+	err = ch.QueueBind(
+		q.Name,       // queue name
+		routingKey,   // routing key
+		"topic_logs", // exchange
+		false,
+		nil,
+	)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+		log.Fatal(err)
 	}
 
-	publishMessage(msg.Body, msg.RoutingKey)
-	w.WriteHeader(http.StatusCreated)
+	msgs, err := ch.Consume(
+		q.Name, // queue
+		"",     // consumer
+		true,   // auto-ack
+		false,  // exclusive
+		false,  // no-local
+		false,  // no-wait
+		nil,    // args
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	for msg := range msgs {
+		handleMessage(msg)
+	}
 }
 
 func main() {
-	http.HandleFunc("/messages", createMessageHandler)
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	go consumeMessages("report.*")
+	go consumeMessages("*.updated")
+	go consumeMessages("report.#")
+	select {}
 }
